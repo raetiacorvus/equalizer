@@ -44,7 +44,7 @@
           </object>
         </child>
         <child type="title">
-          <object class="GtkComboBoxText" id="presetsbox">
+          <object class="GtkComboBox" id="presetsbox">
             <property name="visible">True</property>
             <property name="has_entry">True</property>
             <property name="valign">center</property>

@@ -12,28 +12,18 @@
 import gi
 gi.check_version('3.30')
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gio, GLib
+from gi.repository import Gtk, Gio, GLib, GObject
 
-import os, sys
+import copy, glob, os, sys
 
 from pulseeq.constants import *
+from pulseeq.preset import Preset
 
 def GetSettings():
-    global rawdata
-    global rawpresets
-    global ladspa_filename
-    global ladspa_name
-    global ladspa_label
     global preamp
-    global num_ladspa_controls
-    global ladspa_controls
-    global ladspa_inputs
     global status
     global persistence
-    global preset
     global ranges
-    global presetmatch
-    global clearpreset
 
     print('Getting settings...')
 
@@ -43,53 +33,25 @@ def GetSettings():
     rawdata = f.read().split('\n')
     f.close()
 
-    rawpresets = {}
-    f = open(PRESETS_FILE, 'r')
-    rawpresets = f.read().split('\n')
-    f.close()
-    del rawpresets[len(rawpresets) - 1]
-
-    ladspa_filename = str(rawdata[0])
-    ladspa_name = str(rawdata[1])
-    ladspa_label = str(rawdata[2])
     preamp = rawdata[3]
-    preset = str(rawdata[4])
     status = int(rawdata[5])
     persistence = int(rawdata[6])
     ranges = rawdata[7:9]
-    num_ladspa_controls = int(rawdata[9])
-    ladspa_controls = rawdata[10:10 + num_ladspa_controls]
-    ladspa_inputs = rawdata[10 + num_ladspa_controls:10 + num_ladspa_controls + num_ladspa_controls]
 
-    clearpreset = 1
-    presetmatch = ''
-    for i in range(len(rawpresets)):
-        if rawpresets[i] == preset:
-            print('Match!')
-            presetmatch = 1
+    preset = Preset.from_file(filename=CONFIG_FILE, config=True)
 
+    return preset
 
-def ApplySettings():
-    print('Applying settings...')
-    f = open(CONFIG_FILE, 'w')
-    del rawdata[:]
-    rawdata.append(str(ladspa_filename))
-    rawdata.append(str(ladspa_name))
-    rawdata.append(str(ladspa_label))
-    rawdata.append(str(preamp))
-    rawdata.append(str(preset))
-    rawdata.append(str(status))
-    rawdata.append(str(persistence))
-    for i in range(2):
-        rawdata.append(str(ranges[i]))
-    rawdata.append(str(num_ladspa_controls))
-    for i in range(num_ladspa_controls):
-        rawdata.append(str(ladspa_controls[i]))
-    for i in range(num_ladspa_controls):
-        rawdata.append(str(ladspa_inputs[i]))
-
-    for i in rawdata:
-        f.write(str(i) + '\n')
+def ApplySettings(preset):
+    f = open(CONFIG_FILE, 'w+')
+    lines = [preset.plugin, preset.plugin_name, preset.plugin_label,
+             str(preamp), preset.name, str(status), str(persistence)]
+    lines += [str(r) for r in ranges]
+    lines.append(str(len(preset.bands)))
+    lines += [str(band.control) for band in preset.bands]
+    lines += [str(band.frequency) for band in preset.bands]
+    lines.append('\n')
+    f.write('\n'.join(lines))
     f.close()
 
     os.system('pulseaudio-equalizer interface.applysettings')
@@ -118,136 +80,73 @@ class Equalizer(Gtk.ApplicationWindow):
     grid = Gtk.Template.Child()
     presetsbox = Gtk.Template.Child()
 
-    def on_scale(self, widget, y):
-        global ladspa_controls
-        global preset
-        global clearpreset
-        newvalue = float(round(widget.get_value(), 1))
-        ladspa_controls[y] = newvalue
-        if clearpreset == 1:
-            preset = ''
-            self.presetsbox.get_child().set_text(preset)
+    def on_scale(self, scale, idx):
+        if not self.update_preset:
+            if self.preset.name in self.presets:
+                self.preset = copy.deepcopy(self.preset)
+            self.preset.filename = None
+            self.preset.name = ''
+            self.presetsbox.get_child().set_text(self.preset.name)
 
-        self.scalevalues[y].set_markup('<small>' + str(float(ladspa_controls[y])) + '\ndB</small>')
+            if self.apply_event_source is not None:
+                GLib.source_remove (self.apply_event_source);
 
-        if self.apply_event_source is not None:
-            GLib.source_remove (self.apply_event_source);
+            self.apply_event_source = GLib.timeout_add (500, self.on_apply_event)
 
-        self.apply_event_source = GLib.timeout_add (500, self.on_apply_event)
+        self.preset.bands[idx].control = float(round(scale.get_value(), 1))
+        self.scalevalues[idx].set_markup('<small>{0}\ndB</small>'.format(self.preset.bands[idx].control))
 
     def on_apply_event(self):
-        ApplySettings()
+        ApplySettings(self.preset)
         self.apply_event_source = None
         return False
 
     @Gtk.Template.Callback()
-    def on_presetsbox(self, widget):
-        global preset
-        global presetmatch
-        global clearpreset
-        global ladspa_filename
-        global ladspa_name
-        global ladspa_label
-        global num_ladspa_controls
-        global ladspa_controls
-        global ladspa_inputs
-        preset = self.presetsbox.get_child().get_text()
+    def on_presetsbox(self, combo):
+        if self.update_preset: return
 
-        self.lookup_action('remove').set_enabled(False)
+        if self.apply_event_source is not None:
+            GLib.source_remove (self.apply_event_source);
 
-        presetmatch = ''
-        for i in range(len(rawpresets)):
-            if rawpresets[i] == preset:
-                print('Match!')
-                presetmatch = 1
+        preset_name = combo.get_child().get_text()
+        tree_iter = combo.get_active_iter()
 
-        if presetmatch == 1:
-            if os.path.isfile(os.path.join(USER_PRESET_DIR, preset + '.preset')):
-                f = open(os.path.join(USER_PRESET_DIR, preset + '.preset'), 'r')
-                rawdata = f.read().split('\n')
-                f.close
-                self.lookup_action('remove').set_enabled(True)
-            elif os.path.isfile(os.path.join(SYSTEM_PRESET_DIR, preset + '.preset')):
-                f = open(os.path.join(SYSTEM_PRESET_DIR, preset + '.preset'), 'r')
-                rawdata = f.read().split('\n')
-                f.close
+        if tree_iter is not None or preset_name in self.presets:
+            if tree_iter is not None:
+                model = combo.get_model()
+                preset = model[tree_iter][1]
             else:
-                print("Can't find %s preset" % preset)
+                preset = self.presets[preset_name]
 
-            ladspa_filename = str(rawdata[0])
-            ladspa_name = str(rawdata[1])
-            ladspa_label = str(rawdata[2])
-            preset = str(rawdata[4])
-            num_ladspa_controls = int(rawdata[5])
-            ladspa_controls = rawdata[6:6 + num_ladspa_controls]
-            ladspa_inputs = rawdata[6 + num_ladspa_controls:6 + num_ladspa_controls + num_ladspa_controls]
-
-            clearpreset = ''
-            for i in range(num_ladspa_controls):
-                self.scales[i].set_value(float(ladspa_controls[i]))
-                self.labels[i].set_frequency(ladspa_inputs[i])
-                self.scalevalues[i].set_markup('<small>' + str(float(ladspa_controls[i])) + '\ndB</small>')
-
-            # Set preset again due to interference from scale modifications
-            preset = str(rawdata[4])
-            clearpreset = 1
-            self.presetsbox.get_child().set_text(preset)
-            ApplySettings()
-
-            self.lookup_action('save').set_enabled(False)
+            self.set_preset(preset)
         else:
-            self.lookup_action('save').set_enabled(preset != '')
+            if self.preset.name in self.presets:
+                self.preset = copy.deepcopy(self.preset)
+            self.preset.name = preset_name
+            self.preset.filename = None
+            self.preset.system = False
+            self.apply_event_source = GLib.timeout_add (500, self.on_apply_event)
 
     def on_resetsettings(self, action=None, param=None):
         print('Resetting to defaults...')
         os.system('pulseaudio-equalizer interface.resetsettings')
-        GetSettings()
+
+        preset = GetSettings()
 
         self.lookup_action('eqenabled').set_state(GLib.Variant('b', status))
         Gio.Application.get_default().lookup_action('keepsettings').set_state(GLib.Variant('b', persistence))
-        self.presetsbox.get_child().set_text(preset)
-        for i in range(num_ladspa_controls):
-            self.scales[i].set_value(float(ladspa_controls[i]))
-            self.labels[i].set_frequency(ladspa_inputs[i])
-            self.scalevalues[i].set_markup('<small>' + str(float(ladspa_controls[i])) + '\ndB</small>')
+
+        self.set_preset(preset)
 
     def on_savepreset(self, action, param):
-        global preset
-        global presetmatch
-        preset = self.presetsbox.get_child().get_text()
-        if preset == '' or presetmatch == 1:
+        if self.preset.name == '' or self.preset.name in self.presets:
             print('Invalid preset name')
         else:
-            f = open(os.path.join(USER_PRESET_DIR, preset + '.preset'), 'w')
+            self.preset.save()
+            self.presets[self.preset.name] = self.preset
+            self.presetsstore.append((self.preset.name, self.preset))
 
-            del rawdata[:]
-            rawdata.append(str(ladspa_filename))
-            rawdata.append(str(ladspa_name))
-            rawdata.append(str(ladspa_label))
-            rawdata.append('')
-            rawdata.append(str(preset))
-            rawdata.append(str(num_ladspa_controls))
-            for i in range(num_ladspa_controls):
-                rawdata.append(str(ladspa_controls[i]))
-            for i in range(num_ladspa_controls):
-                rawdata.append(str(ladspa_inputs[i]))
-
-            for i in rawdata:
-                f.write(str(i) + '\n')
-            f.close()
-
-            # Clear preset list from ComboBox
-            self.presetsbox.remove_all()
-
-            # Apply settings (which will save new preset as default)
-            ApplySettings()
-
-            # Refresh (and therefore, sort) preset list
-            GetSettings()
-
-            # Repopulate preset list into ComboBox
-            for i in range(len(rawpresets)):
-                self.presetsbox.append_text(rawpresets[i])
+            ApplySettings(self.preset)
 
             action.set_enabled(False)
             self.lookup_action('remove').set_enabled(True)
@@ -255,74 +154,106 @@ class Equalizer(Gtk.ApplicationWindow):
     def on_eqenabled(self, action, state):
         global status
         status = int(state.get_boolean())
-        ApplySettings()
+        ApplySettings(self.preset)
         action.set_state(state)
 
     def on_removepreset(self, action, param):
-        global preset
-        os.remove(os.path.join(USER_PRESET_DIR, preset + '.preset'))
+        del self.presets[self.preset.name]
+        self.preset.remove()
+        self.update_preset = True
+        for row in self.presetsstore:
+            if row[0] == self.preset.name:
+                self.presetsstore.remove(row.iter)
+                break
+        self.update_preset = False
 
-        self.presetsbox.get_child().set_text('')
-
-        # Clear preset list from ComboBox
-        self.presetsbox.remove_all()
-
-        # Refresh (and therefore, sort) preset list
-        GetSettings()
-
-        # Repopulate preset list into ComboBox
-        for i in range(len(rawpresets)):
-            self.presetsbox.append_text(rawpresets[i])
-
-        preset = ''
-        # Apply settings
-        ApplySettings()
+        self.preset.name = ''
+        self.set_preset(self.preset)
 
         action.set_enabled(False)
 
+    def set_preset(self, preset):
+        self.preset = preset
+
+        self.update_preset = True
+        for idx, band in enumerate(self.preset.bands):
+            self.scales[idx].set_value(band.control)
+            self.labels[idx].set_frequency(band.frequency)
+            self.scalevalues[idx].set_markup('<small>{0}\ndB</small>'.format(band.control))
+
+        self.presetsbox.get_child().set_text(self.preset.name)
+        self.update_preset = False
+
+        self.lookup_action('save').set_enabled(self.preset.name not in self.presets
+                                               and self.preset.name != '')
+
+        self.lookup_action('remove').set_enabled(self.preset.name in self.presets
+                                                 and not self.preset.system)
+
+        ApplySettings(self.preset)
+
     def __init__(self, *args, **kwargs):
         super(Equalizer, self).__init__(*args, **kwargs)
-        GetSettings()
+        global status
+
+        self.presets = {}
+        # read all system presets
+        for filename in glob.glob(os.path.join(SYSTEM_PRESET_DIR, '*.preset')):
+            system_preset = Preset.from_file(filename=filename, system=True)
+            self.presets[system_preset.name] = system_preset
+
+        # read all user presets overriding system preset if it allready exists
+        for filename in glob.glob(os.path.join(USER_PRESET_DIR, '*.preset')):
+            user_preset = Preset.from_file(filename=filename)
+            self.presets[user_preset.name] = user_preset
+
+        preset = GetSettings()
+
+        if preset.name in self.presets:
+            preset = self.presets[preset.name]
+
+        self.update_preset = False
 
         self.apply_event_source = None
 
         # Equalizer bands
-        global scale
         self.scales = {}
         self.labels = {}
         self.scalevalues = {}
-        for x in range(num_ladspa_controls):
+        for idx, band in enumerate(preset.bands):
             scale = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL,
                               draw_value=False, inverted=True, digits=1,
                               expand=True, visible=True)
-            self.scales[x] = scale
+            self.scales[idx] = scale
             scale.set_range(float(ranges[0]), float(ranges[1]))
             scale.set_increments(1, 0.1)
             scale.set_size_request(35, 200)
-            scale.set_value(float(ladspa_controls[x]))
-            scale.connect('value-changed', self.on_scale, x)
-            label = FrequencyLabel(frequency = ladspa_inputs[x])
-            self.labels[x] = label
-            scalevalue = Gtk.Label(visible=True, use_markup=True,
-                label='<small>' + str(scale.get_value())  + '\ndB</small>')
-            self.scalevalues[x] = scalevalue
-            self.grid.attach(label, x, 0, 1, 1)
-            self.grid.attach(scale, x, 1, 1, 2)
-            self.grid.attach(scalevalue, x, 3, 1, 1)
+            scale.connect('value-changed', self.on_scale, idx)
+            label = FrequencyLabel(frequency = band.frequency)
+            self.labels[idx] = label
+            scalevalue = Gtk.Label(visible=True, use_markup=True)
+            self.scalevalues[idx] = scalevalue
+            self.grid.attach(label, idx, 0, 1, 1)
+            self.grid.attach(scale, idx, 1, 1, 2)
+            self.grid.attach(scalevalue, idx, 3, 1, 1)
 
         action = Gio.SimpleAction.new('save', None)
-        action.set_enabled(False)
         action.connect('activate', self.on_savepreset)
         self.add_action(action)
 
         action = Gio.SimpleAction.new('remove', None)
-        action.set_enabled(False)
         action.connect('activate', self.on_removepreset)
         self.add_action(action)
 
-        self.presetsbox.get_child().set_text(preset)
-        for i in range(len(rawpresets)):
-            self.presetsbox.append_text(rawpresets[i])
+        self.presetsstore = Gtk.ListStore(str, GObject.TYPE_PYOBJECT)
+        self.presetsstore.set_sort_column_id(0, Gtk.SortType.ASCENDING)
+        for item in self.presets.items():
+            self.presetsstore.append(item)
+
+        self.presetsbox.set_entry_text_column(0)
+        self.presetsbox.set_model(self.presetsstore)
+
+        self.set_preset(preset)
 
         action = Gio.SimpleAction.new_stateful('eqenabled', None,
                                                GLib.Variant('b', status))
@@ -343,6 +274,8 @@ class Application(Gtk.Application):
         self.window = None
 
     def do_startup(self):
+        global persistence
+
         Gtk.Application.do_startup(self)
         GetSettings()
 
@@ -352,7 +285,6 @@ class Application(Gtk.Application):
         action.connect('activate', self.window.on_resetsettings)
         self.add_action(action)
 
-        global persistence
         action = Gio.SimpleAction.new_stateful('keepsettings', None,
                                                GLib.Variant('b', persistence))
         action.connect('change-state', self.on_keepsettings)
@@ -371,7 +303,7 @@ class Application(Gtk.Application):
     def on_keepsettings(self, action, state):
         global persistence
         persistence = int(state.get_boolean())
-        ApplySettings()
+        ApplySettings(self.window.preset)
         action.set_state(state)
 
     def on_quit(self, action, param):

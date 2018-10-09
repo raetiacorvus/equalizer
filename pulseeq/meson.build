@@ -7,7 +7,7 @@ constants_file = configure_file(
     configuration: constants_conf,
 )
 
-equalizer_sources = ['equalizer.py', constants_file]
+equalizer_sources = ['equalizer.py', 'preset.py', constants_file]
 
 python.install_sources(equalizer_sources,
   subdir: modname
